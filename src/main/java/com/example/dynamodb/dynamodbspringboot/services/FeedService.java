@@ -1,27 +1,34 @@
 package com.example.dynamodb.dynamodbspringboot.services;
 
 import com.example.dynamodb.dynamodbspringboot.model.Feed;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.lang.NonNull;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 import software.amazon.awssdk.core.pagination.sync.SdkIterable;
 import software.amazon.awssdk.enhanced.dynamodb.*;
-import software.amazon.awssdk.enhanced.dynamodb.model.BatchGetResultPageIterable;
-import software.amazon.awssdk.enhanced.dynamodb.model.Page;
-import software.amazon.awssdk.enhanced.dynamodb.model.PageIterable;
-import software.amazon.awssdk.enhanced.dynamodb.model.ReadBatch;
+import software.amazon.awssdk.enhanced.dynamodb.model.*;
 import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
 
-import java.util.Collections;
-import java.util.List;
-import java.util.Optional;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
+import static java.util.stream.Collectors.toMap;
 import static software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional.keyEqualTo;
 import static software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional.sortBetween;
 
 @Service
 public class FeedService {
-  private final static String FEED_TABLE_NAME = "FeedMgmt";
+  private static final Logger log = LoggerFactory.getLogger(FeedService.class);
+  private static final String FEED_TABLE_NAME = "FeedMgmt";
+  private static final String UUID_TOKEN = "uuid:";
+  private static final String COMPONENT_SORT_KEY_FORMAT = "C|%s|%s|%s";
+  private static final String FEED_SORT_KEY_FORMAT = "F|%s";
+
   private final DynamoDbEnhancedClient dynamoDbEnhancedClient;
   private final DynamoDbTable<Feed> feedTable;
 
@@ -90,5 +97,76 @@ public class FeedService {
     }
 
     return feed;
+  }
+
+  public void createFeedItem(String message) {
+    Optional<Feed> feed = tokenizeMessageToFeed(message);
+
+    if(feed.isPresent()) {
+      Feed componentFeed = feed.get();
+      Feed feedItemToUpdate = getFeedItemToUpdate(
+        componentFeed.getPK(),
+        componentFeed.getComponent(),
+        componentFeed.getComponentStatus()
+      );
+
+      BatchWriteItemEnhancedRequest batchWriteItemEnhancedRequest = BatchWriteItemEnhancedRequest.builder()
+        .writeBatches(
+          WriteBatch.builder(Feed.class)
+            .mappedTableResource(feedTable)
+            .addPutItem(componentFeed) // Create component item
+            .addPutItem(feedItemToUpdate) // Update feed item with latest component name and status
+            .build()
+        ).build();
+
+      dynamoDbEnhancedClient.batchWriteItem(batchWriteItemEnhancedRequest);
+    }
+  }
+
+  private Feed getFeedItemToUpdate(
+    final String pk,
+    final String component,
+    final String componentStatus
+  ) {
+    LocalDateTime now = LocalDateTime.now();
+
+    Feed feedItem = new Feed();
+    feedItem.setPK(pk);
+    feedItem.setSK(String.format(FEED_SORT_KEY_FORMAT, pk));
+    feedItem.setComponent(component);
+    feedItem.setComponentStatus(componentStatus);
+    feedItem.setFeedDay(now.format(DateTimeFormatter.ofPattern("yyyyMMdd")));
+    feedItem.setFeedTime(now.format(DateTimeFormatter.ofPattern("HHmm")));
+
+    return feedItem;
+  }
+
+  public Optional<Feed> tokenizeMessageToFeed(String message) {
+    if(StringUtils.isEmpty(message)) {
+      return Optional.empty();
+    }
+
+    Map<String, String> result = Stream.of(message.split(","))
+      .map(s -> s.contains(UUID_TOKEN) ? s.substring(s.indexOf(UUID_TOKEN)).trim(): s.trim())
+      .map(s -> s.split(":"))
+      .filter(s -> !StringUtils.isEmpty(s[1]) && !"null".equalsIgnoreCase(s[1].trim()))
+      .collect(toMap(k -> k[0], v -> v[1].trim()));
+
+    if(!result.keySet().containsAll(Arrays.asList("uuid", "component", "status", "msg"))) {
+      log.error("Message is missing key attributes that are needed in dynamodb table");
+      return Optional.empty();
+    }
+
+    Feed feed = new Feed();
+    feed.setPK(result.get("uuid"));
+    feed.setComponent(result.get("component"));
+    feed.setComponentStatus(result.get("status"));
+    feed.setMessage(result.get("msg"));
+    feed.setTimestamp(LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss")));
+    feed.setSK(
+      String.format(COMPONENT_SORT_KEY_FORMAT, feed.getComponent(), feed.getComponentStatus(), feed.getTimestamp())
+    );
+
+    return Optional.of(feed);
   }
 }
