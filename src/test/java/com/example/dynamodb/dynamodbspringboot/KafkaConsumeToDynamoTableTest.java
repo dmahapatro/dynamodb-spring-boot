@@ -113,26 +113,14 @@ public class KafkaConsumeToDynamoTableTest {
   @Test
   @DisplayName("Check upon receiving message, it is parsed and added to DynamoDB")
   public void testConsumerReceivingMessage() {
-    KafkaConsumer<String, String> consumer = new KafkaConsumer<>(
-      ImmutableMap.of(
-        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers(),
-        ConsumerConfig.GROUP_ID_CONFIG, "group_id",
-        ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"
-      ),
-      new StringDeserializer(),
-      new StringDeserializer()
-    );
-
-    consumer.subscribe(Collections.singleton(TOPIC_NAME));
-
+    // WHEN: A message is published in the topic
     kafkaTemplate.send(
       TOPIC_NAME,
       "2020-07-14 14:41:06,950 INFO  DPLogger - uuid: e55e438e-1703-4331-84e9-0eb7feb1d2da, component: Eb2bEgressSingleOpChannel, ftm: claims_lte_s3_to_nas_lte01t, file: beta/nwindem/interface-test/lte01t/LTECLAIMGL_CONTROL_FEED.ctl, status: Failed, msg: Leaving Eb2bEgressSingleOpChannel sync() - failed results for file beta/nwindem/interface-test/lte01t/LTECLAIMGL_CONTROL_FEED.ctl, timestamp: Tue Jul 14 14:41:06 EDT 2020"
     );
 
+    // THEN: Message is consumed and transformed to DynamoDB items in FeedMgmt Table
     Unreliables.retryUntilTrue(30, TimeUnit.SECONDS, () -> {
-      consumer.poll(Duration.ofMillis(100));
-
       final DynamoDbTable<Feed> feedTable = dynamoDbEnhancedClient.table(TABLE_NAME, TableSchema.fromBean(Feed.class));
 
       PageIterable<Feed> pagedResults = feedTable.query(
@@ -155,7 +143,5 @@ public class KafkaConsumeToDynamoTableTest {
 
       return true;
     });
-
-    consumer.unsubscribe();
   }
 }
