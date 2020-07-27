@@ -15,23 +15,25 @@ import org.springframework.boot.test.util.TestPropertyValues;
 import org.springframework.context.ApplicationContextInitializer;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.lang.NonNull;
 import org.springframework.test.context.ContextConfiguration;
 import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.containers.localstack.LocalStackContainer;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
 import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.shaded.com.google.common.collect.ImmutableMap;
-import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient;
-import software.amazon.awssdk.enhanced.dynamodb.DynamoDbTable;
-import software.amazon.awssdk.enhanced.dynamodb.Key;
-import software.amazon.awssdk.enhanced.dynamodb.TableSchema;
+import software.amazon.awssdk.core.pagination.sync.SdkIterable;
+import software.amazon.awssdk.enhanced.dynamodb.*;
+import software.amazon.awssdk.enhanced.dynamodb.model.CreateTableEnhancedRequest;
+import software.amazon.awssdk.enhanced.dynamodb.model.EnhancedGlobalSecondaryIndex;
+import software.amazon.awssdk.enhanced.dynamodb.model.Page;
 import software.amazon.awssdk.enhanced.dynamodb.model.PageIterable;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.DeleteTableRequest;
+import software.amazon.awssdk.services.dynamodb.model.Projection;
+import software.amazon.awssdk.services.dynamodb.model.ProjectionType;
 
-import java.time.Duration;
-import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -41,6 +43,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.testcontainers.containers.localstack.LocalStackContainer.Service.DYNAMODB;
 import static software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional.keyEqualTo;
+import static software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional.sortBetween;
 
 @SpringBootTest
 @ContextConfiguration(initializers = KafkaConsumeToDynamoTableTest.Initializer.class)
@@ -61,7 +64,7 @@ public class KafkaConsumeToDynamoTableTest {
   static class Initializer implements ApplicationContextInitializer<ConfigurableApplicationContext> {
 
     @Override
-    public void initialize(ConfigurableApplicationContext configurableApplicationContext) {
+    public void initialize(@NonNull ConfigurableApplicationContext configurableApplicationContext) {
       TestPropertyValues values = TestPropertyValues.of(
         "spring.kafka.producer.bootstrap-servers=" + kafka.getBootstrapServers(),
         "spring.kafka.consumer.bootstrap-servers=" + kafka.getBootstrapServers(),
@@ -102,12 +105,27 @@ public class KafkaConsumeToDynamoTableTest {
   void buildUp() {
     final TableSchema<Feed> FEED_TABLE_SCHEMA = TableSchema.fromBean(Feed.class);
     final DynamoDbTable<Feed> feedTable = dynamoDbEnhancedClient.table(TABLE_NAME, FEED_TABLE_SCHEMA);
-    feedTable.createTable();
+
+    // Create Feed Table and the GSI explicitly
+    feedTable.createTable(
+      CreateTableEnhancedRequest.builder()
+        .globalSecondaryIndices(
+          EnhancedGlobalSecondaryIndex.builder()
+            .indexName("DateIdx")
+            .projection(Projection.builder().projectionType(ProjectionType.ALL).build())
+            .build()
+        )
+        .build()
+    );
   }
 
   @AfterEach
   void purge() {
     dynamoDbClient.deleteTable(DeleteTableRequest.builder().tableName(TABLE_NAME).build());
+  }
+
+  private void publish(final String message) {
+    kafkaTemplate.send(TOPIC_NAME, message);
   }
 
   @Test
@@ -139,6 +157,58 @@ public class KafkaConsumeToDynamoTableTest {
         .contains(
           tuple("e55e438e-1703-4331-84e9-0eb7feb1d2da", "C|Eb2bEgressSingleOpChannel|Failed"),
           tuple("e55e438e-1703-4331-84e9-0eb7feb1d2da", "F|e55e438e-1703-4331-84e9-0eb7feb1d2da")
+        );
+
+      return true;
+    });
+  }
+
+  @Test
+  @DisplayName("Check date range query")
+  public void testFeedsDateRangeQueryOnIndex() {
+    // WHEN: A message is published in the topic
+    publish(
+      "2020-07-14 14:41:06,950 INFO  DPLogger - uuid: c45e438e-1703-4331-84e9-0eb7feb1f2da, component: Eb2bEgressSingleOpChannel, ftm: claims_lte_s3_to_nas_lte01t, file: beta/nwindem/interface-test/lte01t/LTECLAIMGL_CONTROL_FEED.ctl, status: Failed, msg: Leaving Eb2bEgressSingleOpChannel sync() - failed results for file beta/nwindem/interface-test/lte01t/LTECLAIMGL_CONTROL_FEED.ctl, timestamp: Tue Jul 14 14:41:06 EDT 2020"
+    );
+
+    // Another message is published to the same topic after a delay
+    Executors.newSingleThreadScheduledExecutor()
+      .scheduleWithFixedDelay(
+        () -> publish("2020-07-14 14:41:06,950 INFO  DPLogger - uuid: ab60v38e-1703-4331-84e9-0eb7feb1f2da, component: Eb2bEgressSingleOpChannel, ftm: claims_lte_s3_to_nas_lte01t, file: beta/nwindem/interface-test/lte01t/LTECLAIMGL_CONTROL_FEED.ctl, status: Failed, msg: Leaving Eb2bEgressSingleOpChannel sync() - failed results for file beta/nwindem/interface-test/lte01t/LTECLAIMGL_CONTROL_FEED.ctl, timestamp: Tue Jul 14 14:41:06 EDT 2020"),
+        3,1, TimeUnit.SECONDS
+      );
+
+    // THEN: Message is consumed and transformed to DynamoDB items in FeedMgmt Table
+    Unreliables.retryUntilTrue(30, TimeUnit.SECONDS, () -> {
+      final DynamoDbTable<Feed> feedTable = dynamoDbEnhancedClient.table(TABLE_NAME, TableSchema.fromBean(Feed.class));
+
+      DynamoDbIndex<Feed> feedsByDateIndex = feedTable.index("DateIdx");
+
+      SdkIterable<Page<Feed>> feedsInDateRange = feedsByDateIndex.query(r ->
+        r.queryConditional(
+          sortBetween(
+            k -> k.partitionValue("20200727").sortValue("0000"),
+            k -> k.partitionValue("20200727").sortValue("2359")
+          )
+        )
+      );
+
+      List<Feed> feedsByRange = feedsInDateRange.stream()
+        .flatMap(feedPage -> feedPage.items().stream())
+        .collect(Collectors.toList());
+
+      // Since second message was added with a delay, in order to assert for 2 items to be returned
+      // the retry logic has to be executed until we have 2 items returned from the query
+      if(feedsByRange.isEmpty() || feedsByRange.size() < 2) {
+        return false;
+      }
+
+      assertThat(feedsByRange)
+        .hasSize(2)
+        .extracting(Feed::getPK, f -> Stream.of(f.getSK().split("\\|")).limit(3).collect(joining("|")))
+        .contains(
+          tuple("c45e438e-1703-4331-84e9-0eb7feb1f2da", "F|c45e438e-1703-4331-84e9-0eb7feb1f2da"),
+          tuple("ab60v38e-1703-4331-84e9-0eb7feb1f2da", "F|ab60v38e-1703-4331-84e9-0eb7feb1f2da")
         );
 
       return true;
