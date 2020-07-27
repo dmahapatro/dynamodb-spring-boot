@@ -32,6 +32,8 @@ import software.amazon.awssdk.services.dynamodb.model.DeleteTableRequest;
 import software.amazon.awssdk.services.dynamodb.model.Projection;
 import software.amazon.awssdk.services.dynamodb.model.ProjectionType;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -132,8 +134,7 @@ public class KafkaConsumeToDynamoTableTest {
   @DisplayName("Check upon receiving message, it is parsed and added to DynamoDB")
   public void testConsumerReceivingMessage() {
     // WHEN: A message is published in the topic
-    kafkaTemplate.send(
-      TOPIC_NAME,
+    publish(
       "2020-07-14 14:41:06,950 INFO  DPLogger - uuid: e55e438e-1703-4331-84e9-0eb7feb1d2da, component: Eb2bEgressSingleOpChannel, ftm: claims_lte_s3_to_nas_lte01t, file: beta/nwindem/interface-test/lte01t/LTECLAIMGL_CONTROL_FEED.ctl, status: Failed, msg: Leaving Eb2bEgressSingleOpChannel sync() - failed results for file beta/nwindem/interface-test/lte01t/LTECLAIMGL_CONTROL_FEED.ctl, timestamp: Tue Jul 14 14:41:06 EDT 2020"
     );
 
@@ -181,14 +182,15 @@ public class KafkaConsumeToDynamoTableTest {
     // THEN: Message is consumed and transformed to DynamoDB items in FeedMgmt Table
     Unreliables.retryUntilTrue(30, TimeUnit.SECONDS, () -> {
       final DynamoDbTable<Feed> feedTable = dynamoDbEnhancedClient.table(TABLE_NAME, TableSchema.fromBean(Feed.class));
+      String today = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
 
       DynamoDbIndex<Feed> feedsByDateIndex = feedTable.index("DateIdx");
 
       SdkIterable<Page<Feed>> feedsInDateRange = feedsByDateIndex.query(r ->
         r.queryConditional(
           sortBetween(
-            k -> k.partitionValue("20200727").sortValue("0000"),
-            k -> k.partitionValue("20200727").sortValue("2359")
+            k -> k.partitionValue(today).sortValue("0000"),
+            k -> k.partitionValue(today).sortValue("2359")
           )
         )
       );
