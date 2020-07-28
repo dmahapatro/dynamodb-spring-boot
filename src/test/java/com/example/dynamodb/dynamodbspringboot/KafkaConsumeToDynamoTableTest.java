@@ -207,7 +207,7 @@ public class KafkaConsumeToDynamoTableTest {
 
       assertThat(feedsByRange)
         .hasSize(2)
-        .extracting(Feed::getPK, f -> Stream.of(f.getSK().split("\\|")).limit(3).collect(joining("|")))
+        .extracting(Feed::getPK, Feed::getSK)
         .contains(
           tuple("c45e438e-1703-4331-84e9-0eb7feb1f2da", "F|c45e438e-1703-4331-84e9-0eb7feb1f2da"),
           tuple("ab60v38e-1703-4331-84e9-0eb7feb1f2da", "F|ab60v38e-1703-4331-84e9-0eb7feb1f2da")
